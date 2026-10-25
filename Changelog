@@ -8,6 +8,10 @@ unreleased:
 - added incremental snapshots (JS_SNAPSHOT_BASE, JS_SNAPSHOT_DELTA): a
   delta only contains the changes since a base snapshot; a modified
   object is saved as a patch of its base version
+- added chained checkpoints (JS_SNAPSHOT_CHAIN, JS_ReadSnapshotChain(),
+  JS_GetSnapshotBaseId()): a checkpoint only contains the changes since
+  the previous checkpoint, and the restored state is the base of the
+  next one
 - a base snapshot is reproducible (the Math.random() state is saved in
   full snapshots and deltas, not in bases): a host can rebuild it
   instead of storing it
