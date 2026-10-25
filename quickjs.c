@@ -68,11 +68,11 @@
 
 /* define to include Atomics.* operations which depend on the OS
    threads */
-#if !defined(__EMSCRIPTEN__)
+#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
 #define CONFIG_ATOMICS
 #endif
 
-#if !defined(__EMSCRIPTEN__)
+#if !defined(__EMSCRIPTEN__) && !defined(__wasi__)
 /* enable stack limitation */
 #define CONFIG_STACK_CHECK
 #endif
