@@ -1620,7 +1620,9 @@ int JS_EnumCodeNames(JSContext *ctx, JSValueConst obj,
    applies a delta on top of its base. A runtime restored from a base
    (with or without a delta) has that base attached, so its next deltas
    are relative to the same base. Deltas are not chained: each one only
-   needs the base.
+   needs the base. Chained checkpoints (JS_SNAPSHOT_CHAIN) are: each one
+   holds what changed since the previous checkpoint and
+   JS_ReadSnapshotChain() applies a sequence of them.
 
    A base is reproducible: runtimes of the same engine build set up the
    same way (same host natives, same code run) write the same base bytes,
@@ -1678,6 +1680,11 @@ typedef struct JSSnapshotHost {
 #define JS_SNAPSHOT_BASE  (1 << 0)
 /* only the differences with the base of the runtime */
 #define JS_SNAPSHOT_DELTA (1 << 1)
+/* chained checkpoint: a delta relative to the current base, after which
+   the state that was written becomes the new base of the runtime. The
+   next checkpoint then only contains what changed since this one.
+   JS_ReadSnapshotChain() applies a sequence of checkpoints. */
+#define JS_SNAPSHOT_CHAIN (1 << 2)
 
 /* Serialize the runtime of 'ctx' ('flags' is 0 for a self-contained
    snapshot, or one of JS_SNAPSHOT_x). 'roots' are values held by the host
@@ -1705,6 +1712,19 @@ int JS_ReadSnapshot(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
                     const uint8_t *delta, size_t delta_len,
                     const JSSnapshotHost *host, JSSnapshotResult *res,
                     char *errbuf, size_t errbuf_size);
+/* Same as JS_ReadSnapshot() with a sequence of 'delta_count' deltas
+   applied in order on top of 'buf': every delta but the last must be a
+   chained checkpoint (JS_SNAPSHOT_CHAIN) and each one must have been
+   written from the state left by the previous one. If the last delta is
+   a chained checkpoint, the restored state becomes the base of 'rt', so
+   the next checkpoint it writes continues the chain. */
+int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
+                         const uint8_t * const *deltas, const size_t *delta_lens,
+                         int delta_count, const JSSnapshotHost *host,
+                         JSSnapshotResult *res, char *errbuf, size_t errbuf_size);
+/* id of the base attached to 'rt' (0 if none). A delta or checkpoint
+   written now records it as the id of the state it applies to. */
+uint64_t JS_GetSnapshotBaseId(JSRuntime *rt);
 /* Detach the base of the incremental snapshots (if any): the cells of
    the base can be garbage collected again. */
 void JS_DropSnapshotBase(JSRuntime *rt);

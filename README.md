@@ -306,6 +306,16 @@ Deltas are not chained: each delta needs only the base. A runtime restored from 
 base attached, so the deltas it writes are relative to the same base. Many runtimes can share
 one base.
 
+**Chained checkpoints.** A delta grows with everything that changed since the base. To store
+only what changed since the *previous* save, write with `JS_SNAPSHOT_CHAIN` instead: the
+checkpoint is a delta of the current base, and the state it describes then becomes the new base
+of the runtime. Each checkpoint records the id of the state it applies to, so the ids form a
+chain. `JS_ReadSnapshotChain(rt, base, base_len, deltas, delta_lens, n, ...)` applies the
+checkpoints in order and refuses a missing, reordered or foreign one. A runtime restored this way
+continues the chain: its next `JS_SNAPSHOT_CHAIN` checkpoint applies on top of the last one it
+read. `JS_GetSnapshotBaseId()` returns the id the next checkpoint will apply to, for the host to
+store with it.
+
 Bases are reproducible. Runtimes of the same engine build that are set up the same way (same host
 natives, same code run) write byte-identical bases, in any process. So a host doesn't have to
 store the base: it can rebuild it and keep only the deltas. `qjs --drepl` works this way. The
