@@ -1544,6 +1544,8 @@ static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
 static JSValue js_import_meta(JSContext *ctx);
 static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier, JSValueConst options);
 static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
+/* quickjs-snapshot.c: a cell of the attached snapshot base is freed */
+static void snap_cell_freed(JSRuntime *rt, void *ptr);
 static JSValue js_using_get_dispose_method(JSContext *ctx, JSValueConst val,
                                            BOOL is_async);
 static JSValue js_dispose_merge_error(JSContext *ctx, JSValue error,
@@ -3232,6 +3234,7 @@ void __JS_FreeContext(JSContext *ctx)
     int i;
 
     assert(js_rc(ctx)->ref_count == 0);
+    snap_cell_freed(rt, ctx);
 
 #ifdef ENABLE_DUMPS // JS_DUMP_ATOMS
     if (check_dump_flag(rt, JS_DUMP_ATOMS))
@@ -7400,6 +7403,7 @@ static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
     if (var_ref) {
         assert(js_rc(var_ref)->ref_count > 0);
         if (--js_rc(var_ref)->ref_count == 0) {
+            snap_cell_freed(rt, var_ref);
             if (var_ref->is_detached) {
                 JS_FreeValueRT(rt, var_ref->value);
             } else {
@@ -7651,6 +7655,7 @@ static void free_object(JSRuntime *rt, JSObject *p)
 
 static void free_gc_object(JSRuntime *rt, JSGCObjectHeader *gp)
 {
+    snap_cell_freed(rt, gp);
     switch(js_rc(gp)->gc_obj_type) {
     case JS_GC_OBJ_TYPE_JS_OBJECT:
         free_object(rt, (JSObject *)gp);
@@ -66900,6 +66905,7 @@ static void js_promise_resolve_function_free_resolved(JSRuntime *rt,
                                                       JSPromiseFunctionDataResolved *sr)
 {
     if (--sr->ref_count == 0) {
+        snap_cell_freed(rt, sr);
         js_free_rt(rt, sr);
     }
 }

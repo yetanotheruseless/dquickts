@@ -1632,10 +1632,11 @@ int JS_EnumCodeNames(JSContext *ctx, JSValueConst obj,
    of a base: full snapshots and deltas save them, and a base read
    without a delta gets a fresh seed and time origin.
 
-   While a base is attached, the runtime references every cell, string
-   and atom of the base so that they keep their identity: they are not
-   garbage collected (weak references to them never become empty) until
-   JS_DropSnapshotBase() or JS_FreeRuntime().
+   While a base is attached, the runtime references every string and
+   atom of the base so that they keep their index, until
+   JS_DropSnapshotBase() or JS_FreeRuntime(). The cells of the base are
+   not referenced: a base cell freed by the program becomes a tombstone
+   that the next delta or checkpoint records.
 
    ArrayBuffer data is always restored into engine-owned memory (host
    buffers are copied and their free function is not kept).

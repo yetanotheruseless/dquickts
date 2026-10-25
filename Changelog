@@ -15,6 +15,9 @@ unreleased:
 - snapshot format 9: the elements of a fast array are written before its
   properties and end with a terminator, so that a push only changes the
   end of the array body (a delta then saves it as a small patch)
+- the base of incremental snapshots no longer keeps its cells alive: a
+  cell freed since the base becomes a tombstone that the next delta or
+  checkpoint records, and the reader does not rebuild it
 - a base snapshot is reproducible (the Math.random() state is saved in
   full snapshots and deltas, not in bases): a host can rebuild it
   instead of storing it
