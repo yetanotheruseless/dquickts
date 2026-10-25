@@ -3,6 +3,9 @@
 #   make check          build and run every test host (with self-contained
 #                       and incremental snapshots), then hibernate scripts
 #                       across processes (cross_process.sh)
+#   test_chain          chained checkpoints next to base-relative deltas,
+#                       restore from a chain, broken chains; test_churn
+#                       checks that dropped objects leave the chain
 #   make ASAN=1 check   same with AddressSanitizer + UBSan (separate build dir)
 #   make stress         hibernate every 97 branches: test_hibernate on the
 #                       scripts of js/ and on the upstream tests
@@ -61,6 +64,8 @@ $(OBJDIR)/hibernate: $(OBJDIR)/hibernate.o $(ENGINE_OBJS)
 check: all
 	./$(OBJDIR)/test_suspend
 	./$(OBJDIR)/test_snapshot_api
+	./$(OBJDIR)/test_chain
+	./$(OBJDIR)/test_churn
 	./$(OBJDIR)/test_snapshot $(SCRIPTS) $(MODULES)
 	./$(OBJDIR)/test_snapshot -d $(SCRIPTS) $(MODULES)
 	./$(OBJDIR)/test_hibernate $(SCRIPTS) $(UPSTREAM_TESTS)
