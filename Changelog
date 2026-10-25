@@ -12,6 +12,9 @@ unreleased:
   JS_GetSnapshotBaseId()): a checkpoint only contains the changes since
   the previous checkpoint, and the restored state is the base of the
   next one
+- snapshot format 9: the elements of a fast array are written before its
+  properties and end with a terminator, so that a push only changes the
+  end of the array body (a delta then saves it as a small patch)
 - a base snapshot is reproducible (the Math.random() state is saved in
   full snapshots and deltas, not in bases): a host can rebuild it
   instead of storing it

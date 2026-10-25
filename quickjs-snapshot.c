@@ -57,7 +57,7 @@
  */
 
 static const uint8_t snap_magic[8] = { 'Q', 'J', 'S', 'S', 'N', 'A', 'P', '\n' };
-#define SNAP_FORMAT_VERSION 8
+#define SNAP_FORMAT_VERSION 9
 
 typedef enum {
     SNAP_KIND_FULL,
@@ -97,6 +97,7 @@ typedef enum {
     SNAP_VAL_MODULE,
     SNAP_VAL_BYTECODE,
     SNAP_VAL_DEAD,         /* weak reference to a collected target */
+    SNAP_VAL_END,          /* end of a value list (fast arrays) */
 } SnapValueTag;
 
 typedef enum {
@@ -1063,14 +1064,17 @@ static int snap_write_frame(SnapWriter *w, JSAsyncFunctionState *s)
     return 0;
 }
 
+/* The elements end with a terminator instead of starting with a count,
+   so that appending to an array only changes the end of its body (a
+   changed body is saved as a patch of its common prefix and suffix). */
 static int snap_write_fast_array(SnapWriter *w, JSObject *p)
 {
     uint32_t i;
-    bc_put_leb128(&w->bc, p->u.array.count);
     for(i = 0; i < p->u.array.count; i++) {
         if (snap_put_value(w, p->u.array.u.values[i]))
             return -1;
     }
+    bc_put_u8(&w->bc, SNAP_VAL_END);
     return 0;
 }
 
@@ -1087,9 +1091,7 @@ static int snap_write_payload(SnapWriter *w, JSObject *p)
         break;
     case JS_CLASS_ARRAY:
     case JS_CLASS_ARGUMENTS:
-        if (p->fast_array)
-            return snap_write_fast_array(w, p);
-        break;
+        break; /* fast array elements are written before the properties */
     case JS_CLASS_MAPPED_ARGUMENTS:
         if (p->fast_array) {
             bc_put_leb128(&w->bc, p->u.array.count);
@@ -1245,6 +1247,15 @@ static int snap_write_object(SnapWriter *w, JSObject *p)
     if (p->fast_array)
         flags |= SNAP_OBJ_FAST_ARRAY;
     bc_put_u8(&w->bc, flags);
+
+    /* fast array elements come before the properties: a push changes
+       'length' (a property) and appends elements, so this keeps the
+       common prefix of the body long (see snap_put_changed_body()) */
+    if (p->fast_array &&
+        (p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS)) {
+        if (snap_write_fast_array(w, p))
+            return -1;
+    }
 
     /* the properties end with JS_ATOM_NULL rather than starting with
        their count, so that adding one only changes the end of the
@@ -2548,29 +2559,37 @@ static int snap_read_frame(SnapReader *r, SnapRCell *c)
     return 0;
 }
 
+/* elements until SNAP_VAL_END; the array is kept consistent while it
+   grows so that its finalizer can run if the read fails */
 static int snap_read_fast_array(SnapReader *r, JSObject *p)
 {
-    JSValue *tab;
-    uint32_t i, count;
+    JSValue *tab = NULL, v;
+    uint32_t count = 0, size = 0;
+    uint8_t tag;
 
-    if (snap_get_leb(r, &count))
-        return -1;
-    if (count == 0)
-        return 0;
-    if (count > INT32_MAX / sizeof(JSValue))
-        return snap_error(r, "invalid array length");
-    tab = js_malloc(r->ctx, sizeof(tab[0]) * count);
-    if (!tab)
-        return -1;
-    for(i = 0; i < count; i++)
-        tab[i] = JS_UNDEFINED;
-    p->u.array.u.values = tab;
-    p->u.array.count = count;
-    if (p->class_id == JS_CLASS_ARRAY)
-        p->u.array.u1.size = count;
-    for(i = 0; i < count; i++) {
-        if (snap_get_value(r, &tab[i]))
+    for(;;) {
+        if (r->bc.ptr >= r->bc.buf_end)
+            return snap_error(r, "truncated array");
+        tag = *r->bc.ptr;
+        if (tag == SNAP_VAL_END) {
+            r->bc.ptr++;
+            break;
+        }
+        if (count >= size) {
+            uint32_t new_size = max_int(size * 3 / 2, 8);
+            JSValue *t = js_realloc(r->ctx, tab, sizeof(tab[0]) * new_size);
+            if (!t)
+                return -1;
+            tab = t;
+            size = new_size;
+            p->u.array.u.values = tab;
+            if (p->class_id == JS_CLASS_ARRAY)
+                p->u.array.u1.size = size;
+        }
+        if (snap_get_value(r, &v))
             return -1;
+        tab[count++] = v;
+        p->u.array.count = count;
     }
     return 0;
 }
@@ -2588,10 +2607,9 @@ static int snap_read_payload(SnapReader *r, JSObject *p, int flags)
         break;
     case JS_CLASS_ARRAY:
     case JS_CLASS_ARGUMENTS:
-        snap_payload_ready(r); /* empty array part */
-        if (flags & SNAP_OBJ_FAST_ARRAY)
-            return snap_read_fast_array(r, p);
-        p->fast_array = 0;
+        snap_payload_ready(r); /* the elements were read before the properties */
+        if (!(flags & SNAP_OBJ_FAST_ARRAY))
+            p->fast_array = 0;
         break;
     case JS_CLASS_MAPPED_ARGUMENTS:
         snap_payload_ready(r); /* empty array part */
@@ -2939,6 +2957,15 @@ static int snap_read_object(SnapReader *r, int idx)
     js_free_shape(r->rt, p->shape);
     p->shape = sh;
 
+    if ((flags & SNAP_OBJ_FAST_ARRAY) &&
+        (p->class_id == JS_CLASS_ARRAY || p->class_id == JS_CLASS_ARGUMENTS)) {
+        /* the elements, before the properties; the array stays
+           consistent while it grows, so its finalizer may run */
+        r->cur_obj = p;
+        r->cur_obj_ready = TRUE;
+        if (snap_read_fast_array(r, p))
+            return -1;
+    }
     for(;;) {
         if (bc_get_atom(&r->bc, &atom))
             return -1;
