@@ -525,8 +525,9 @@ static int snap_natives_init(JSRuntime *rt, SnapNatives *n,
 /* cells and base of the incremental snapshots */
 
 typedef struct {
-    void *ptr;
+    void *ptr; /* NULL in a base: the cell was freed (tombstone) */
     SnapCellType type;
+    uint8_t tomb; /* base: the tombstone is already in the chain */
 } SnapCell;
 
 static void snap_cell_dup(SnapCell *c)
@@ -592,8 +593,7 @@ void JS_DropSnapshotBase(JSRuntime *rt)
     if (!base)
         return;
     rt->snapshot_base = NULL;
-    for(i = 0; i < base->cell_count; i++)
-        snap_cell_free(rt, &base->cells[i]);
+    /* the base holds no reference to its cells */
     for(i = 0; i < base->atom_count; i++)
         JS_FreeAtomRT(rt, base->atoms[i]);
     for(i = 0; i < base->str_count; i++)
@@ -611,6 +611,23 @@ void JS_DropSnapshotBase(JSRuntime *rt)
 uint64_t JS_GetSnapshotBaseId(JSRuntime *rt)
 {
     return rt->snapshot_base ? rt->snapshot_base->id : 0;
+}
+
+/* The base holds no reference to its cells, so that the program can drop
+   them: when a base cell is freed, its slot becomes a tombstone that the
+   next delta or checkpoint records (the reader then does not rebuild it).
+   The slot keeps its index. A stale map entry whose address is reused by
+   a new cell is detected by comparing the pointer with the slot. */
+static void snap_cell_freed(JSRuntime *rt, void *ptr)
+{
+    JSSnapshotBase *base = rt->snapshot_base;
+    SnapMapEntry *e;
+
+    if (!base || !base->cell_map.tab)
+        return;
+    e = snap_map_find(&base->cell_map, ptr);
+    if (e && base->cells[e->val].ptr == ptr)
+        base->cells[e->val].ptr = NULL;
 }
 
 /*******************************************************************/
@@ -662,6 +679,9 @@ struct SnapWriter {
     int *changed; /* JS_SNAPSHOT_DELTA: base cells with a new body */
     int changed_count;
     int changed_size;
+    int *dead; /* JS_SNAPSHOT_DELTA: base cells freed since the base (tombstones) */
+    int dead_count;
+    int dead_size;
     /* JS_SNAPSHOT_BASE: bodies of the cells without length prefix */
     DynBuf base_bodies;
     uint32_t *base_offsets;
@@ -703,7 +723,8 @@ static int snap_put_ref(SnapWriter *w, SnapCellType type, void *ptr)
         bc_put_leb128(&w->bc, 0);
         return 0;
     }
-    if (w->base && (e = snap_map_find(&w->base->cell_map, ptr))) {
+    if (w->base && (e = snap_map_find(&w->base->cell_map, ptr)) &&
+        w->base->cells[e->val].ptr == ptr) {
         idx = e->val;
         if (!w->base_queued[idx]) {
             w->base_queued[idx] = TRUE;
@@ -1402,11 +1423,30 @@ static int snap_write_body(SnapWriter *w, int idx)
     DynBuf *body;
     int ret;
 
-    /* the body is written in its own buffer to compare and measure it */
+    if (!c.ptr) {
+        /* a base cell freed since the base: a tombstone, unless the chain
+           already has it. Its slot keeps an empty body. */
+        if (!c.tomb) {
+            if (snap_resize(w->rt, (void **)&w->dead, sizeof(w->dead[0]),
+                            &w->dead_size, w->dead_count + 1))
+                return snap_writer_oom(w);
+            w->dead[w->dead_count++] = idx;
+        }
+        if (w->chain) {
+            DynBuf empty = { 0 };
+            return snap_collect_body(w, idx, &empty);
+        }
+        return 0;
+    }
+    /* the body is written in its own buffer to compare and measure it.
+       The cell is held: the base does not reference it and writing may
+       run host hooks. */
+    snap_cell_dup(&c);
     w->bc.dbuf = w->scratch;
     w->bc.dbuf.size = 0;
     ret = snap_write_cell(w, &c);
     w->scratch = w->bc.dbuf;
+    snap_cell_free(w->rt, &c);
     w->bc.dbuf = out;
     body = &w->scratch;
     if (ret)
@@ -1565,6 +1605,9 @@ static int snap_write_output(SnapWriter *w, DynBuf *roots, uint64_t *pid)
         bc_put_leb128(s, w->changed_count);
         for(i = 0; i < w->changed_count; i++)
             bc_put_leb128(s, w->changed[i]);
+        bc_put_leb128(s, w->dead_count);
+        for(i = 0; i < w->dead_count; i++)
+            bc_put_leb128(s, w->dead[i]);
     }
 
     base_atom_count = w->base ? w->base->atom_count : 0;
@@ -1630,11 +1673,19 @@ static int snap_attach_written_base(SnapWriter *w, uint64_t id)
     base->str_count = w->str_count;
     base->str_map = w->str_map;
     memset(&w->str_map, 0, sizeof(w->str_map));
-    base->cells = w->cells;
+    base->cells = js_malloc_rt(rt, sizeof(base->cells[0]) * max_int(w->cell_count, 1));
+    if (!base->cells) {
+        js_free_rt(rt, base->atoms);
+        js_free_rt(rt, base->strs);
+        js_free_rt(rt, base);
+        return snap_writer_oom(w);
+    }
+    for(i = 0; i < w->cell_count; i++) {
+        base->cells[i] = w->cells[i];
+        base->cells[i].tomb = 0;
+    }
     base->cell_count = w->cell_count;
-    base->cell_map = w->cell_map;
-    w->cells = NULL;
-    w->cell_count = 0;
+    base->cell_map = w->cell_map; /* the writer's references are freed after */
     memset(&w->cell_map, 0, sizeof(w->cell_map));
     base->bodies = w->base_bodies.buf;
     base->body_offsets = w->base_offsets;
@@ -1669,12 +1720,18 @@ static int snap_promote_written_base(SnapWriter *w, uint64_t id)
     base->strs = js_malloc_rt(rt, sizeof(base->strs[0]) * max_int(n_str, 1));
     if (!base->cells || !base->atoms || !base->strs)
         goto oom;
-    for(i = 0; i < old->cell_count; i++)
+    for(i = 0; i < old->cell_count; i++) {
         base->cells[i] = old->cells[i];
-    for(i = 0; i < w->cell_count; i++)
+        if (!base->cells[i].ptr)
+            base->cells[i].tomb = 1; /* recorded by this checkpoint (or before) */
+    }
+    for(i = 0; i < w->cell_count; i++) {
         base->cells[old->cell_count + i] = w->cells[i];
+        base->cells[old->cell_count + i].tomb = 0;
+    }
     for(i = 0; i < n; i++) {
-        if (snap_map_add(rt, &base->cell_map, base->cells[i].ptr, i))
+        if (base->cells[i].ptr &&
+            snap_map_add(rt, &base->cell_map, base->cells[i].ptr, i))
             goto oom;
     }
     for(i = 0; i < old->str_count; i++)
@@ -1693,8 +1750,9 @@ static int snap_promote_written_base(SnapWriter *w, uint64_t id)
     base->atom_count = w->bc.idx_to_atom_count;
     for(i = 0; i < w->str_count; i++)
         w->strs[i].key = JS_UNDEFINED;
-    w->cell_count = 0;
-    old->cell_count = 0;
+    /* the writer keeps its references to the new cells and frees them
+       after the new base is installed: cells that die then become
+       tombstones of the next checkpoint */
     old->str_count = 0;
     base->bodies = w->base_bodies.buf;
     base->body_offsets = w->base_offsets;
@@ -1731,6 +1789,7 @@ static void snap_writer_free(SnapWriter *w)
     js_free_rt(rt, w->cells);
     js_free_rt(rt, w->queue);
     js_free_rt(rt, w->changed);
+    js_free_rt(rt, w->dead);
     js_free_rt(rt, w->base_queued);
     js_free_rt(rt, w->base_offsets);
     dbuf_free(&w->scratch);
@@ -1752,6 +1811,7 @@ uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
     struct list_head *el;
     DynBuf roots_buf;
     uint64_t id = 0;
+    size_t gc_threshold = ctx->rt->malloc_gc_threshold;
     int i, n;
 
     *psize = 0;
@@ -1784,6 +1844,9 @@ uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
         JS_ThrowTypeError(ctx, "snapshot: JS code is running");
         goto fail;
     }
+    /* no cycle collection while walking: the base does not pin its cells */
+    gc_threshold = rt->malloc_gc_threshold;
+    rt->malloc_gc_threshold = SIZE_MAX;
     if (snap_natives_init(rt, &w->natives, host, TRUE)) {
         snap_writer_oom(w);
         goto fail;
@@ -1895,10 +1958,12 @@ uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
         goto fail;
     *psize = w->bc.dbuf.size;
     snap_writer_free(w);
+    rt->malloc_gc_threshold = gc_threshold;
     return w->bc.dbuf.buf;
  fail:
     dbuf_free(&w->bc.dbuf);
     snap_writer_free(w);
+    rt->malloc_gc_threshold = gc_threshold;
     return NULL;
 }
 
@@ -1912,6 +1977,7 @@ typedef struct {
     uint8_t changed; /* base cell whose body is in the delta */
     uint32_t changed_in; /* 1 + index of the last delta listing it as changed */
     uint32_t body_in; /* 1 + index of the last delta giving it a body */
+    uint8_t dead; /* tombstone: the cell is not rebuilt */
     union {
         JSClassID class_id; /* SNAP_CELL_OBJECT */
         struct { /* SNAP_CELL_FRAME */
@@ -2099,6 +2165,10 @@ static int snap_get_ref(SnapReader *r, SnapCellType type, void **pptr)
     if (v >= r->cell_count || r->cells[v].type != type) {
         *pptr = NULL; /* avoid warning */
         return snap_error(r, "invalid %s reference", snap_cell_type_names[type]);
+    }
+    if (r->cells[v].dead) {
+        *pptr = NULL;
+        return snap_error(r, "reference to the freed %s #%u", snap_cell_type_names[type], v);
     }
     *pptr = r->cells[v].ptr;
     return 0;
@@ -3664,6 +3734,8 @@ static int snap_read_bodies(SnapReader *r)
     int i;
 
     for(i = 0; i < r->cell_count; i++) {
+        if (r->cells[i].dead)
+            continue;
         if (!r->cur_ptrs[i])
             return snap_error(r, "%s #%d has no body", snap_cell_type_names[r->cells[i].type], i);
         in.start = in.ptr = r->cur_ptrs[i];
@@ -3679,7 +3751,7 @@ static int snap_read_bodies(SnapReader *r)
    the base bodies, so that the runtime can write deltas */
 static int snap_attach_read_base(SnapReader *r, int n, const uint8_t **ptrs,
                                  const uint32_t *lens, int atom_count,
-                                 int str_count, uint64_t id)
+                                 int str_count, uint64_t id, BOOL tomb)
 {
     JSRuntime *rt = r->rt;
     JSSnapshotBase *base;
@@ -3704,14 +3776,15 @@ static int snap_attach_read_base(SnapReader *r, int n, const uint8_t **ptrs,
     off = 0;
     for(i = 0; i < n; i++) {
         SnapCell *c = &base->cells[i];
-        c->ptr = r->cells[i].ptr;
+        c->ptr = r->cells[i].dead ? NULL : r->cells[i].ptr; /* no reference taken */
         c->type = r->cells[i].type;
-        snap_cell_dup(c);
+        c->tomb = r->cells[i].dead && tomb;
         base->cell_count++;
-        if (snap_map_add(rt, &base->cell_map, c->ptr, i))
+        if (c->ptr && snap_map_add(rt, &base->cell_map, c->ptr, i))
             goto fail;
         base->body_offsets[i] = off;
-        memcpy(base->bodies + off, ptrs[i], lens[i]);
+        if (lens[i])
+            memcpy(base->bodies + off, ptrs[i], lens[i]);
         off += lens[i];
     }
     base->body_offsets[n] = off;
@@ -3845,7 +3918,7 @@ int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
     r->chain_id = r->base_id;
     for(d = 0; d < delta_count; d++) {
         uint64_t id;
-        uint32_t n, idx;
+        uint32_t n, ndead, idx;
         int start = r->cell_count;
         SnapKind kind;
         SnapInput bodies;
@@ -3873,12 +3946,28 @@ int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
         for(i = 0; i < n; i++) {
             if (snap_hdr_leb(r, &idx))
                 goto fail;
-            if (idx >= start || r->cells[idx].changed_in == d + 1) {
+            if (idx >= start || r->cells[idx].dead || r->cells[idx].changed_in == d + 1) {
                 snap_error(r, "invalid changed cell");
                 goto fail;
             }
             r->cells[idx].changed_in = d + 1;
             r->cells[idx].changed = TRUE;
+        }
+        if (snap_hdr_leb(r, &ndead))
+            goto fail;
+        for(i = 0; i < ndead; i++) {
+            if (snap_hdr_leb(r, &idx))
+                goto fail;
+            if (idx >= start || r->cells[idx].dead || r->cells[idx].changed_in == d + 1) {
+                snap_error(r, "invalid tombstone");
+                goto fail;
+            }
+            if (r->cells[idx].type == SNAP_CELL_CONTEXT) {
+                snap_error(r, "freed context #%u", idx);
+                goto fail;
+            }
+            r->cells[idx].dead = TRUE;
+            snap_set_cur(r, idx, NULL, 0, FALSE);
         }
         if (snap_read_atoms(r) || snap_read_strings(r) ||
             snap_hdr_section(r, &r->delta_roots))
@@ -3901,6 +3990,22 @@ int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
     if (!r->obj_flags) {
         snap_error(r, "out of memory");
         goto fail;
+    }
+    /* the shells of the dead cells are released: nothing may reference them */
+    for(i = 0; i < r->cell_count; i++) {
+        SnapRCell *c = &r->cells[i];
+        if (c->dead) {
+            SnapCell c1 = { c->ptr, c->type };
+            if (c->type == SNAP_CELL_OBJECT) {
+                JSObject *p = c->ptr; /* no finalizer for an empty payload */
+                p->class_id = JS_CLASS_OBJECT;
+                p->fast_array = 0;
+                p->is_exotic = 0;
+            }
+            snap_cell_free(rt, &c1);
+            c->ptr = NULL;
+            c->done = TRUE;
+        }
     }
     snap_set_input(r, delta_count ? &r->delta_roots : &r->base_roots);
     r->roots_seeded = delta_count > 0 || !r->base_id;
@@ -3926,7 +4031,7 @@ int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
 
     /* flags that add_property() may have changed while rebuilding */
     for(i = 0; i < r->cell_count; i++) {
-        if (r->cells[i].type == SNAP_CELL_OBJECT) {
+        if (r->cells[i].type == SNAP_CELL_OBJECT && !r->cells[i].dead) {
             JSObject *p = r->cells[i].ptr;
             int flags = r->obj_flags[i];
             p->extensible = (flags & SNAP_OBJ_EXTENSIBLE) != 0;
@@ -3948,12 +4053,13 @@ int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
     if (r->attach_chain) {
         /* the restored state is the base of the next checkpoint */
         if (snap_attach_read_base(r, r->cell_count, r->cur_ptrs, r->cur_lens,
-                                  r->bc.idx_to_atom_count, r->str_count, r->chain_id))
+                                  r->bc.idx_to_atom_count, r->str_count,
+                                  r->chain_id, TRUE))
             goto fail;
     } else if (r->base_id &&
                snap_attach_read_base(r, r->base_cell_count, r->base_body_ptrs,
                                      r->base_body_lens, r->base_atom_count,
-                                     r->base_str_count, r->base_id)) {
+                                     r->base_str_count, r->base_id, FALSE)) {
         goto fail;
     }
     ret = 0;

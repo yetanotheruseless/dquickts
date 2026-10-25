@@ -354,9 +354,11 @@ If you take the base after setup instead, the deltas shrink to the size of the c
 [Rust example](#rust-bindings), the base is 13,403 bytes and the delta after one function call is
 128 bytes.
 
-While a base is attached, the runtime keeps every cell, string and atom of the base alive, so
-that they keep their identity. They are not garbage collected, and weak references to them never
-become empty. `JS_DropSnapshotBase()` releases them. After that, the next delta needs a new base.
+While a base is attached, the runtime keeps every string and atom of the base alive, so that
+they keep their index. The cells of the base are not kept alive: the program can drop them, and a
+freed base cell becomes a tombstone that the next delta or checkpoint records, so the reader
+does not rebuild it. `JS_DropSnapshotBase()` detaches the base. After that, the next delta needs
+a new base.
 
 ### How it works
 
