@@ -1509,6 +1509,13 @@ typedef struct JSSnapshotHost {
    next checkpoint then only contains what changed since this one.
    JS_ReadSnapshotChain() applies a sequence of checkpoints. */
 #define JS_SNAPSHOT_CHAIN (1 << 2)
+/* fold: a chained checkpoint written relative to the anchor (see
+   JS_SetSnapshotAnchor()) instead of the current base, so that it holds
+   everything that changed since the anchor; the written state becomes
+   the new base and the anchor stays. A chain restored by
+   JS_ReadSnapshotChain() may then be: base, checkpoints up to the anchor,
+   the fold, the checkpoints after it. */
+#define JS_SNAPSHOT_FOLD  (1 << 3)
 
 /* Serialize the runtime of 'ctx' ('flags' is 0 for a self-contained
    snapshot, or one of JS_SNAPSHOT_x). 'roots' are values held by the host
@@ -1549,6 +1556,20 @@ int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
 /* id of the base attached to 'rt' (0 if none). A delta or checkpoint
    written now records it as the id of the state it applies to. */
 uint64_t JS_GetSnapshotBaseId(JSRuntime *rt);
+/* Keep a copy of the current base as the anchor of the folds: a shared
+   layer (e.g. the harness) that every fold of this runtime is written
+   against. Returns -1 and throws if there is no base. The anchor is
+   dropped by JS_DropSnapshotAnchor() or JS_FreeRuntime(). */
+int JS_SetSnapshotAnchor(JSContext *ctx);
+void JS_DropSnapshotAnchor(JSRuntime *rt);
+uint64_t JS_GetSnapshotAnchorId(JSRuntime *rt);
+/* Same as JS_ReadSnapshotChain(); if 'anchor_delta' is >= 0, the state
+   after that checkpoint also becomes the anchor of the runtime. */
+int JS_ReadSnapshotChainAnchored(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
+                                 const uint8_t * const *deltas, const size_t *delta_lens,
+                                 int delta_count, int anchor_delta,
+                                 const JSSnapshotHost *host,
+                                 JSSnapshotResult *res, char *errbuf, size_t errbuf_size);
 /* Detach the base of the incremental snapshots (if any): the cells of
    the base can be garbage collected again. */
 void JS_DropSnapshotBase(JSRuntime *rt);
