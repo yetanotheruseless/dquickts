@@ -585,14 +585,21 @@ typedef struct JSSnapshotBase {
     SnapMap str_map; /* string or rope -> index */
 } JSSnapshotBase;
 
+static void snap_base_free(JSRuntime *rt, JSSnapshotBase *base);
+
 void JS_DropSnapshotBase(JSRuntime *rt)
 {
     JSSnapshotBase *base = rt->snapshot_base;
-    int i;
-
     if (!base)
         return;
     rt->snapshot_base = NULL;
+    snap_base_free(rt, base);
+}
+
+static void snap_base_free(JSRuntime *rt, JSSnapshotBase *base)
+{
+    int i;
+
     /* the base holds no reference to its cells */
     for(i = 0; i < base->atom_count; i++)
         JS_FreeAtomRT(rt, base->atoms[i]);
@@ -613,14 +620,87 @@ uint64_t JS_GetSnapshotBaseId(JSRuntime *rt)
     return rt->snapshot_base ? rt->snapshot_base->id : 0;
 }
 
+/* a copy of 'src' with its own references and maps */
+static JSSnapshotBase *snap_base_copy(JSContext *ctx, const JSSnapshotBase *src)
+{
+    JSRuntime *rt = ctx->rt;
+    JSSnapshotBase *base;
+    uint32_t size;
+    int i;
+
+    base = js_mallocz_rt(rt, sizeof(*base));
+    if (!base)
+        return NULL;
+    base->id = src->id;
+    size = src->body_offsets[src->cell_count];
+    base->cells = js_malloc_rt(rt, sizeof(base->cells[0]) * max_int(src->cell_count, 1));
+    base->body_offsets = js_malloc_rt(rt, sizeof(base->body_offsets[0]) * (src->cell_count + 1));
+    base->bodies = js_malloc_rt(rt, max_int(size, 1));
+    base->atoms = js_malloc_rt(rt, sizeof(base->atoms[0]) * max_int(src->atom_count, 1));
+    base->strs = js_malloc_rt(rt, sizeof(base->strs[0]) * max_int(src->str_count, 1));
+    if (!base->cells || !base->body_offsets || !base->bodies || !base->atoms || !base->strs)
+        goto fail;
+    memcpy(base->cells, src->cells, sizeof(base->cells[0]) * src->cell_count);
+    memcpy(base->body_offsets, src->body_offsets, sizeof(base->body_offsets[0]) * (src->cell_count + 1));
+    memcpy(base->bodies, src->bodies, size);
+    base->cell_count = src->cell_count;
+    for(i = 0; i < base->cell_count; i++) {
+        if (base->cells[i].ptr && snap_map_add(rt, &base->cell_map, base->cells[i].ptr, i))
+            goto fail;
+    }
+    for(i = 0; i < src->atom_count; i++)
+        base->atoms[base->atom_count++] = JS_DupAtom(ctx, src->atoms[i]);
+    for(i = 0; i < src->str_count; i++) {
+        base->strs[base->str_count++] = JS_DupValue(ctx, src->strs[i]);
+        if (snap_map_add(rt, &base->str_map, JS_VALUE_GET_PTR(src->strs[i]), i))
+            goto fail;
+    }
+    return base;
+ fail:
+    snap_base_free(rt, base);
+    return NULL;
+}
+
+void JS_DropSnapshotAnchor(JSRuntime *rt)
+{
+    JSSnapshotBase *anchor = rt->snapshot_anchor;
+    if (!anchor)
+        return;
+    rt->snapshot_anchor = NULL;
+    snap_base_free(rt, anchor);
+}
+
+int JS_SetSnapshotAnchor(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    JSSnapshotBase *anchor;
+
+    if (!rt->snapshot_base) {
+        JS_ThrowTypeError(ctx, "snapshot: no base to anchor");
+        return -1;
+    }
+    anchor = snap_base_copy(ctx, rt->snapshot_base);
+    if (!anchor) {
+        JS_ThrowOutOfMemory(ctx);
+        return -1;
+    }
+    JS_DropSnapshotAnchor(rt);
+    rt->snapshot_anchor = anchor;
+    return 0;
+}
+
+uint64_t JS_GetSnapshotAnchorId(JSRuntime *rt)
+{
+    return rt->snapshot_anchor ? rt->snapshot_anchor->id : 0;
+}
+
 /* The base holds no reference to its cells, so that the program can drop
    them: when a base cell is freed, its slot becomes a tombstone that the
    next delta or checkpoint records (the reader then does not rebuild it).
    The slot keeps its index. A stale map entry whose address is reused by
    a new cell is detected by comparing the pointer with the slot. */
-static void snap_cell_freed(JSRuntime *rt, void *ptr)
+static void snap_base_cell_freed(JSSnapshotBase *base, void *ptr)
 {
-    JSSnapshotBase *base = rt->snapshot_base;
     SnapMapEntry *e;
 
     if (!base || !base->cell_map.tab)
@@ -628,6 +708,12 @@ static void snap_cell_freed(JSRuntime *rt, void *ptr)
     e = snap_map_find(&base->cell_map, ptr);
     if (e && base->cells[e->val].ptr == ptr)
         base->cells[e->val].ptr = NULL;
+}
+
+static void snap_cell_freed(JSRuntime *rt, void *ptr)
+{
+    snap_base_cell_freed(rt->snapshot_base, ptr);
+    snap_base_cell_freed(rt->snapshot_anchor, ptr);
 }
 
 /*******************************************************************/
@@ -646,6 +732,7 @@ struct SnapWriter {
     SnapNatives natives;
     int flags; /* JS_SNAPSHOT_x */
     BOOL chain; /* JS_SNAPSHOT_CHAIN: a delta, then the written state becomes the base */
+    BOOL fold; /* JS_SNAPSHOT_FOLD: the delta is relative to the anchor, which stays */
     int collected; /* bodies kept for the new base so far (in cell order) */
     /* JS_SNAPSHOT_DELTA: the entities of the base keep their indexes,
        the new ones are numbered after them */
@@ -1749,7 +1836,7 @@ static int snap_promote_written_base(SnapWriter *w, uint64_t id)
             goto oom;
     }
     for(i = 0; i < old->str_count; i++)
-        base->strs[i] = old->strs[i];
+        base->strs[i] = w->fold ? JS_DupValue(w->ctx, old->strs[i]) : old->strs[i];
     for(i = 0; i < w->str_count; i++)
         base->strs[old->str_count + i] = w->strs[i].key;
     for(i = 0; i < n_str; i++) {
@@ -1767,15 +1854,24 @@ static int snap_promote_written_base(SnapWriter *w, uint64_t id)
     /* the writer keeps its references to the new cells and frees them
        after the new base is installed: cells that die then become
        tombstones of the next checkpoint */
-    old->str_count = 0;
     base->bodies = w->base_bodies.buf;
     base->body_offsets = w->base_offsets;
     w->base_bodies.buf = NULL;
     w->base_offsets = NULL;
-    JS_DropSnapshotBase(rt); /* the old base: its atoms, arrays and maps */
-    rt->snapshot_base = base;
+    if (w->fold) {
+        /* 'old' is the anchor: it keeps its references and stays */
+        rt->snapshot_base = base;
+    } else {
+        old->str_count = 0; /* the string references moved to the new base */
+        JS_DropSnapshotBase(rt); /* the old base: its atoms, arrays and maps */
+        rt->snapshot_base = base;
+    }
     return 0;
  oom:
+    if (w->fold) {
+        for(i = 0; i < old->str_count; i++)
+            JS_FreeValueRT(rt, base->strs[i]);
+    }
     js_free_rt(rt, base->cells);
     js_free_rt(rt, base->atoms);
     js_free_rt(rt, base->strs);
@@ -1826,6 +1922,7 @@ uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
     DynBuf roots_buf;
     uint64_t id = 0;
     size_t gc_threshold = ctx->rt->malloc_gc_threshold;
+    JSSnapshotBase *chain_base = NULL; /* JS_SNAPSHOT_FOLD: the base set aside */
     int i, n;
 
     *psize = 0;
@@ -1843,6 +1940,22 @@ uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
     js_dbuf_init(ctx, &w->bodies);
     js_dbuf_init(ctx, &w->base_bodies);
 
+    if (flags & JS_SNAPSHOT_FOLD) {
+        /* a chained checkpoint relative to the anchor */
+        if (!rt->snapshot_anchor) {
+            JS_ThrowTypeError(ctx, "snapshot: no anchor (JS_SetSnapshotAnchor)");
+            goto fail;
+        }
+        if (!rt->snapshot_base) {
+            JS_ThrowTypeError(ctx, "snapshot: no base");
+            goto fail;
+        }
+        w->fold = TRUE;
+        chain_base = rt->snapshot_base;
+        rt->snapshot_base = rt->snapshot_anchor;
+        flags = (flags & ~JS_SNAPSHOT_FOLD) | JS_SNAPSHOT_CHAIN;
+        w->flags = flags;
+    }
     if (flags & JS_SNAPSHOT_CHAIN) {
         /* a delta whose result is promoted to base */
         w->chain = TRUE;
@@ -1970,11 +2083,18 @@ uint8_t *JS_WriteSnapshot(JSContext *ctx, size_t *psize,
         goto fail;
     if (w->chain && snap_promote_written_base(w, id))
         goto fail;
+    if (chain_base) {
+        /* the fold replaced the chain base */
+        snap_base_free(rt, chain_base);
+        chain_base = NULL;
+    }
     *psize = w->bc.dbuf.size;
     snap_writer_free(w);
     rt->malloc_gc_threshold = gc_threshold;
     return w->bc.dbuf.buf;
  fail:
+    if (chain_base)
+        rt->snapshot_base = chain_base; /* the anchor stays where it was */
     dbuf_free(&w->bc.dbuf);
     snap_writer_free(w);
     rt->malloc_gc_threshold = gc_threshold;
@@ -2066,6 +2186,14 @@ struct SnapReader {
     int cur_size;
     uint64_t chain_id; /* id of the state after the last chained checkpoint */
     BOOL attach_chain; /* attach the restored state (not the base) as the base */
+    /* JS_ReadSnapshotChainAnchored(): the state after one checkpoint,
+       recorded while the deltas are applied, becomes the anchor */
+    int anchor_cells, anchor_atoms, anchor_strs;
+    uint64_t anchor_id;
+    uint8_t **anchor_ptrs; /* copies of the bodies at that point */
+    uint32_t *anchor_lens;
+    uint8_t *anchor_dead; /* cells already dead at that point */
+    BOOL anchor_set;
     SnapOpaque *opaques; /* host-class data, loaded at the end */
     int opaque_count;
     int opaque_size;
@@ -3765,19 +3893,20 @@ static int snap_read_bodies(SnapReader *r)
 
 /* the snapshot that was read is a base: attach it to the runtime with
    the base bodies, so that the runtime can write deltas */
-static int snap_attach_read_base(SnapReader *r, int n, const uint8_t **ptrs,
-                                 const uint32_t *lens, int atom_count,
-                                 int str_count, uint64_t id, BOOL tomb)
+static int snap_build_read_base(SnapReader *r, int n, const uint8_t **ptrs,
+                                const uint32_t *lens, int atom_count,
+                                int str_count, uint64_t id, BOOL tomb,
+                                const uint8_t *tomb_flags, JSSnapshotBase **pbase)
 {
     JSRuntime *rt = r->rt;
     JSSnapshotBase *base;
     uint32_t off;
     int i;
 
+    *pbase = NULL;
     base = js_mallocz_rt(rt, sizeof(*base));
     if (!base)
         return snap_error(r, "out of memory");
-    rt->snapshot_base = base; /* freed by JS_DropSnapshotBase() on error */
     base->id = id;
     off = 0;
     for(i = 0; i < n; i++)
@@ -3794,7 +3923,7 @@ static int snap_attach_read_base(SnapReader *r, int n, const uint8_t **ptrs,
         SnapCell *c = &base->cells[i];
         c->ptr = r->cells[i].dead ? NULL : r->cells[i].ptr; /* no reference taken */
         c->type = r->cells[i].type;
-        c->tomb = r->cells[i].dead && tomb;
+        c->tomb = tomb_flags ? tomb_flags[i] : (r->cells[i].dead && tomb);
         base->cell_count++;
         if (c->ptr && snap_map_add(rt, &base->cell_map, c->ptr, i))
             goto fail;
@@ -3811,10 +3940,52 @@ static int snap_attach_read_base(SnapReader *r, int n, const uint8_t **ptrs,
         if (snap_map_add(rt, &base->str_map, r->strs[i], i))
             goto fail;
     }
+    *pbase = base;
     return 0;
  fail:
-    JS_DropSnapshotBase(rt);
+    snap_base_free(rt, base);
     return snap_error(r, "out of memory");
+}
+
+static int snap_attach_read_base(SnapReader *r, int n, const uint8_t **ptrs,
+                                 const uint32_t *lens, int atom_count,
+                                 int str_count, uint64_t id, BOOL tomb)
+{
+    JSSnapshotBase *base;
+    if (snap_build_read_base(r, n, ptrs, lens, atom_count, str_count, id, tomb, NULL, &base))
+        return -1;
+    JS_DropSnapshotBase(r->rt);
+    r->rt->snapshot_base = base;
+    return 0;
+}
+
+/* copies of the current bodies: the state after the anchor checkpoint */
+static int snap_record_anchor(SnapReader *r)
+{
+    JSRuntime *rt = r->rt;
+    int i;
+
+    r->anchor_ptrs = js_mallocz_rt(rt, sizeof(r->anchor_ptrs[0]) * max_int(r->cell_count, 1));
+    r->anchor_lens = js_mallocz_rt(rt, sizeof(r->anchor_lens[0]) * max_int(r->cell_count, 1));
+    r->anchor_dead = js_mallocz_rt(rt, max_int(r->cell_count, 1));
+    if (!r->anchor_ptrs || !r->anchor_lens || !r->anchor_dead)
+        return snap_error(r, "out of memory");
+    for(i = 0; i < r->cell_count; i++) {
+        r->anchor_dead[i] = r->cells[i].dead;
+        if (r->cells[i].dead || !r->cur_ptrs[i])
+            continue;
+        r->anchor_ptrs[i] = js_malloc_rt(rt, max_int(r->cur_lens[i], 1));
+        if (!r->anchor_ptrs[i])
+            return snap_error(r, "out of memory");
+        memcpy(r->anchor_ptrs[i], r->cur_ptrs[i], r->cur_lens[i]);
+        r->anchor_lens[i] = r->cur_lens[i];
+    }
+    r->anchor_cells = r->cell_count;
+    r->anchor_atoms = r->bc.idx_to_atom_count;
+    r->anchor_strs = r->str_count;
+    r->anchor_id = r->chain_id;
+    r->anchor_set = TRUE;
+    return 0;
 }
 
 /* drop the references held by the reader */
@@ -3845,6 +4016,13 @@ static void snap_reader_free(SnapReader *r)
     js_free_rt(rt, r->cur_ptrs);
     js_free_rt(rt, r->cur_lens);
     js_free_rt(rt, r->cur_owned);
+    if (r->anchor_ptrs) {
+        for(i = 0; i < r->anchor_cells; i++)
+            js_free_rt(rt, r->anchor_ptrs[i]);
+    }
+    js_free_rt(rt, r->anchor_ptrs);
+    js_free_rt(rt, r->anchor_lens);
+    js_free_rt(rt, r->anchor_dead);
     for(i = 0; i < r->str_count; i++)
         JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_STRING, r->strs[i]));
     js_free_rt(rt, r->strs);
@@ -3875,6 +4053,16 @@ int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
                          const uint8_t * const *deltas, const size_t *delta_lens,
                          int delta_count, const JSSnapshotHost *host,
                          JSSnapshotResult *res, char *errbuf, size_t errbuf_size)
+{
+    return JS_ReadSnapshotChainAnchored(rt, buf, buf_len, deltas, delta_lens, delta_count,
+                                        -1, host, res, errbuf, errbuf_size);
+}
+
+int JS_ReadSnapshotChainAnchored(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
+                                 const uint8_t * const *deltas, const size_t *delta_lens,
+                                 int delta_count, int anchor_delta,
+                                 const JSSnapshotHost *host,
+                                 JSSnapshotResult *res, char *errbuf, size_t errbuf_size)
 {
     SnapReader rr, *r = &rr;
     SnapInput in, base_bodies;
@@ -4000,6 +4188,18 @@ int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
             r->chain_id = 0;
             r->attach_chain = FALSE;
         }
+        if (d == anchor_delta) {
+            if (kind != SNAP_KIND_CHAIN) {
+                snap_error(r, "the anchor checkpoint #%d is not chained", d);
+                goto fail;
+            }
+            if (snap_record_anchor(r))
+                goto fail;
+        }
+    }
+    if (anchor_delta >= delta_count) {
+        snap_error(r, "no checkpoint #%d to anchor", anchor_delta);
+        goto fail;
     }
 
     r->obj_flags = js_mallocz_rt(rt, max_int(r->cell_count, 1));
@@ -4072,6 +4272,15 @@ int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
                                   r->bc.idx_to_atom_count, r->str_count,
                                   r->chain_id, TRUE))
             goto fail;
+        if (r->anchor_set) {
+            JSSnapshotBase *anchor;
+            if (snap_build_read_base(r, r->anchor_cells, (const uint8_t **)r->anchor_ptrs,
+                                     r->anchor_lens, r->anchor_atoms, r->anchor_strs,
+                                     r->anchor_id, TRUE, r->anchor_dead, &anchor))
+                goto fail;
+            JS_DropSnapshotAnchor(rt);
+            rt->snapshot_anchor = anchor;
+        }
     } else if (r->base_id &&
                snap_attach_read_base(r, r->base_cell_count, r->base_body_ptrs,
                                      r->base_body_lens, r->base_atom_count,

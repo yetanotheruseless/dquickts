@@ -411,6 +411,7 @@ struct JSRuntime {
     /* base of the incremental snapshots (JS_SNAPSHOT_BASE), NULL if none.
        It references every cell, atom and string of the base. */
     struct JSSnapshotBase *snapshot_base;
+    struct JSSnapshotBase *snapshot_anchor; /* the base the folds are written against */
     void *user_opaque;
     /* run in LIFO order at the end of JS_FreeRuntime() */
     struct JSRuntimeFinalizerState *finalizers;
@@ -2837,6 +2838,7 @@ void JS_FreeRuntime(JSRuntime *rt)
     JS_FreeValueRT(rt, rt->current_exception);
 
     JS_DropSnapshotBase(rt);
+    JS_DropSnapshotAnchor(rt);
 
     /* drop the suspended execution */
     if (rt->suspended) {
