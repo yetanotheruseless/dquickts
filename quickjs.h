@@ -1730,6 +1730,18 @@ int JS_ReadSnapshotChain(JSRuntime *rt, const uint8_t *buf, size_t buf_len,
                          const uint8_t * const *deltas, const size_t *delta_lens,
                          int delta_count, const JSSnapshotHost *host,
                          JSSnapshotResult *res, char *errbuf, size_t errbuf_size);
+/* Apply 'delta_count' chained checkpoints to the live runtime 'rt',
+   which must hold the base they continue (restored from a chain, or
+   having written it): changed cells are reset and read again in place,
+   new cells are created, freed cells are released, and the state after
+   the last checkpoint becomes the base. Much cheaper than restoring the
+   whole chain when the base is large and the checkpoints are small.
+   Returns 0, or -1 with a message in 'errbuf': the runtime is then
+   inconsistent and must be freed. A changed module or bytecode cell is
+   reported as an error. */
+int JS_ApplySnapshotChain(JSRuntime *rt, const uint8_t * const *deltas, const size_t *delta_lens,
+                          int delta_count, const JSSnapshotHost *host,
+                          JSSnapshotResult *res, char *errbuf, size_t errbuf_size);
 /* id of the base attached to 'rt' (0 if none). A delta or checkpoint
    written now records it as the id of the state it applies to. */
 uint64_t JS_GetSnapshotBaseId(JSRuntime *rt);

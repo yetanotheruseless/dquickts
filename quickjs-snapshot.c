@@ -3878,7 +3878,7 @@ static int snap_read_bodies(SnapReader *r)
     int i;
 
     for(i = 0; i < r->cell_count; i++) {
-        if (r->cells[i].dead)
+        if (r->cells[i].dead || r->cells[i].done)
             continue;
         if (!r->cur_ptrs[i])
             return snap_error(r, "%s #%d has no body", snap_cell_type_names[r->cells[i].type], i);
@@ -4297,6 +4297,580 @@ int JS_ReadSnapshotChainAnchored(JSRuntime *rt, const uint8_t *buf, size_t buf_l
     snap_neutralize_cells(r);
     if (errbuf_size && !errbuf[0]) {
         /* error thrown by the engine while reading */
+        JSValue exc = r->ctx ? JS_GetException(r->ctx) : JS_UNINITIALIZED;
+        const char *msg = NULL;
+        if (JS_IsObject(exc)) {
+            JSValue m = JS_GetPropertyStr(r->ctx, exc, "message");
+            msg = JS_ToCString(r->ctx, m);
+            JS_FreeValue(r->ctx, m);
+        }
+        snprintf(errbuf, errbuf_size, "%s", msg ? msg : "invalid snapshot");
+        if (msg)
+            JS_FreeCString(r->ctx, msg);
+        JS_FreeValue(r->ctx, exc);
+    }
+    for(i = 0; i < res->context_count; i++)
+        JS_FreeContext(res->contexts[i]);
+    for(i = 0; i < res->root_count; i++)
+        JS_FreeValueRT(rt, res->roots[i]);
+    JS_FreeSnapshotResult(rt, res);
+ done:
+    rt->malloc_gc_threshold = gc_threshold;
+    snap_reader_free(r);
+    return ret;
+}
+
+
+/*******************************************************************/
+/* applying checkpoints to a live runtime */
+
+/* Reset a live cell to the empty shell snap_new_cell() creates, keeping
+   its address and its GC header: its body is then read again from the
+   checkpoint. The references the old body held are released here. */
+static int snap_reset_cell(SnapReader *r, int idx)
+{
+    SnapRCell *c = &r->cells[idx];
+    JSRuntime *rt = r->rt;
+    JSContext *ctx = r->ctx;
+    int i;
+
+    switch(c->type) {
+    case SNAP_CELL_OBJECT:
+        {
+            JSObject *p = c->ptr;
+            JSClassID class_id = p->class_id;
+            JSShape *sh = p->shape;
+            JSShapeProperty *pr = get_shape_prop(sh);
+            JSClassFinalizer *finalizer;
+
+            /* as free_object(), the structure excepted */
+            for(i = 0; i < sh->prop_count; i++) {
+                free_property(rt, &p->prop[i], pr->flags);
+                pr++;
+            }
+            js_free_rt(rt, p->prop);
+            js_free_shape(rt, sh);
+            p->shape = NULL;
+            p->prop = NULL;
+            finalizer = rt->class_array[class_id].finalizer;
+            if (finalizer)
+                (*finalizer)(rt, JS_MKPTR(JS_TAG_OBJECT, p));
+            /* as JS_NewObjectFromShape() with a non NULL 'props' */
+            memset(&p->u, 0, sizeof(p->u));
+            p->class_id = class_id;
+            p->is_std_array_prototype = 0;
+            p->extensible = TRUE;
+            p->is_exotic = 0;
+            p->fast_array = 0;
+            p->is_constructor = 0;
+            p->has_immutable_prototype = 0;
+            p->tmp_mark = 0;
+            p->is_HTMLDDA = 0;
+            sh = find_hashed_shape_proto(rt, NULL);
+            if (sh) {
+                sh = js_dup_shape(sh);
+            } else {
+                sh = js_new_shape(ctx, NULL);
+                if (!sh)
+                    goto oom_object;
+            }
+            p->shape = sh;
+            p->prop = js_malloc_rt(rt, sizeof(JSProperty) * sh->prop_size);
+            if (!p->prop) {
+                js_free_shape(rt, sh);
+            oom_object:
+                /* leave a shell that can be freed */
+                p->class_id = JS_CLASS_OBJECT;
+                p->shape = NULL;
+                return snap_error(r, "out of memory");
+            }
+            switch(class_id) {
+            case JS_CLASS_ARRAY:
+                p->is_exotic = 1;
+                p->fast_array = 1;
+                break;
+            case JS_CLASS_C_FUNCTION:
+                p->prop[0].u.value = JS_UNDEFINED;
+                break;
+            case JS_CLASS_ARGUMENTS:
+            case JS_CLASS_MAPPED_ARGUMENTS:
+            case JS_CLASS_UINT8C_ARRAY:
+            case JS_CLASS_INT8_ARRAY:
+            case JS_CLASS_UINT8_ARRAY:
+            case JS_CLASS_INT16_ARRAY:
+            case JS_CLASS_UINT16_ARRAY:
+            case JS_CLASS_INT32_ARRAY:
+            case JS_CLASS_UINT32_ARRAY:
+            case JS_CLASS_BIG_INT64_ARRAY:
+            case JS_CLASS_BIG_UINT64_ARRAY:
+            case JS_CLASS_FLOAT16_ARRAY:
+            case JS_CLASS_FLOAT32_ARRAY:
+            case JS_CLASS_FLOAT64_ARRAY:
+                p->is_exotic = 1;
+                p->fast_array = 1;
+                break;
+            case JS_CLASS_DATAVIEW:
+                break;
+            case JS_CLASS_NUMBER:
+            case JS_CLASS_STRING:
+            case JS_CLASS_BOOLEAN:
+            case JS_CLASS_SYMBOL:
+            case JS_CLASS_DATE:
+            case JS_CLASS_BIG_INT:
+                p->u.object_data = JS_UNDEFINED;
+                goto set_exotic;
+            case JS_CLASS_ERROR:
+                p->u.object_data = JS_UNINITIALIZED;
+                break;
+            case JS_CLASS_REGEXP:
+                break;
+            case JS_CLASS_GLOBAL_OBJECT:
+                p->u.global_object.uninitialized_vars = JS_UNDEFINED;
+                break;
+            default:
+            set_exotic:
+                if (rt->class_array[class_id].exotic)
+                    p->is_exotic = 1;
+                break;
+            }
+        }
+        break;
+    case SNAP_CELL_VAR_REF:
+        {
+            JSVarRef *var_ref = c->ptr;
+            if (var_ref->is_detached) {
+                JS_FreeValueRT(rt, var_ref->value);
+            } else {
+                JSStackFrame *sf = var_ref->stack_frame;
+                sf->var_refs[var_ref->var_ref_idx] = NULL;
+                if (sf->js_mode & JS_MODE_ASYNC)
+                    async_func_free(rt, container_of(sf, JSAsyncFunctionState, frame));
+            }
+            /* as js_create_var_ref() */
+            var_ref->value = JS_UNDEFINED;
+            var_ref->pvalue = &var_ref->value;
+            var_ref->is_detached = TRUE;
+            var_ref->is_lexical = FALSE;
+            var_ref->is_const = FALSE;
+        }
+        break;
+    case SNAP_CELL_FRAME:
+        {
+            JSAsyncFunctionState *s = c->ptr;
+            JSStackFrame *sf = &s->frame;
+            /* the sizes snap_read_frame() checks, from the live frame */
+            c->u.frame.arg_buf_len = sf->arg_count;
+            c->u.frame.var_count = (JSValue *)sf->var_refs - sf->var_buf;
+            c->u.frame.stack_size = 0;
+            c->u.frame.var_ref_count = 0;
+            if (!s->is_completed && JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT) {
+                JSObject *fp = JS_VALUE_GET_OBJ(sf->cur_func);
+                if (snap_is_bytecode_function(fp->class_id)) {
+                    JSFunctionBytecode *b = fp->u.func.function_bytecode;
+                    c->u.frame.var_count = b->var_count;
+                    c->u.frame.stack_size = b->stack_size;
+                    c->u.frame.var_ref_count = b->var_ref_count;
+                }
+            }
+            /* as __async_func_free(), the structure and var_refs excepted */
+            if (!s->is_completed)
+                async_func_free_frame(rt, s);
+            if (s->suspended_child) {
+                async_func_free(rt, s->suspended_child);
+                s->suspended_child = NULL;
+            }
+            JS_FreeValueRT(rt, s->resolving_funcs[0]);
+            JS_FreeValueRT(rt, s->resolving_funcs[1]);
+            /* as snap_new_cell() */
+            s->is_completed = TRUE;
+            s->throw_flag = 0;
+            s->this_val = JS_UNDEFINED;
+            s->new_target = JS_UNDEFINED;
+            s->resolving_funcs[0] = JS_UNDEFINED;
+            s->resolving_funcs[1] = JS_UNDEFINED;
+            s->is_suspended_frame = 0;
+            s->pending_native = 0;
+            s->pending_opcode = 0;
+            s->pending_argc = 0;
+            sf->cur_func = JS_UNDEFINED;
+            sf->cur_sp = sf->arg_buf;
+            sf->js_mode = JS_MODE_ASYNC;
+        }
+        break;
+    case SNAP_CELL_CONTEXT:
+        {
+            JSContext *c1 = c->ptr;
+            struct list_head *el, *el1;
+            /* as JS_FreeContext(), the structure excepted */
+            list_for_each_safe(el, el1, &c1->loaded_modules) {
+                JSModuleDef *m = list_entry(el, JSModuleDef, link);
+                list_del(&m->link);
+                m->link.next = NULL;
+                m->link.prev = NULL;
+                JS_FreeValueRT(rt, JS_MKPTR(JS_TAG_MODULE, m));
+            }
+            init_list_head(&c1->loaded_modules);
+            JS_FreeValueRT(rt, c1->global_obj);
+            JS_FreeValueRT(rt, c1->global_var_obj);
+            JS_FreeValueRT(rt, c1->throw_type_error);
+            JS_FreeValueRT(rt, c1->eval_obj);
+            JS_FreeValueRT(rt, c1->array_proto_values);
+            for(i = 0; i < JS_CONTEXT_VALUE_COUNT; i++)
+                JS_FreeValueRT(rt, c1->user_values[i]);
+            for(i = 0; i < JS_NATIVE_ERROR_COUNT; i++)
+                JS_FreeValueRT(rt, c1->native_error_proto[i]);
+            for(i = 0; i < rt->class_count; i++)
+                JS_FreeValueRT(rt, c1->class_proto[i]);
+            JS_FreeValueRT(rt, c1->iterator_ctor);
+            JS_FreeValueRT(rt, c1->async_iterator_proto);
+            JS_FreeValueRT(rt, c1->promise_ctor);
+            JS_FreeValueRT(rt, c1->error_ctor);
+            JS_FreeValueRT(rt, c1->array_ctor);
+            JS_FreeValueRT(rt, c1->regexp_ctor);
+            JS_FreeValueRT(rt, c1->function_ctor);
+            JS_FreeValueRT(rt, c1->function_proto);
+            js_free_shape_null(rt, c1->array_shape);
+            js_free_shape_null(rt, c1->arguments_shape);
+            js_free_shape_null(rt, c1->mapped_arguments_shape);
+            js_free_shape_null(rt, c1->regexp_shape);
+            js_free_shape_null(rt, c1->regexp_result_shape);
+            /* as snap_new_context() */
+            for(i = 0; i < rt->class_count; i++)
+                c1->class_proto[i] = JS_NULL;
+            c1->function_proto = JS_NULL;
+            c1->function_ctor = JS_NULL;
+            c1->array_ctor = JS_NULL;
+            c1->regexp_ctor = JS_NULL;
+            c1->promise_ctor = JS_NULL;
+            c1->error_ctor = JS_NULL;
+            for(i = 0; i < JS_NATIVE_ERROR_COUNT; i++)
+                c1->native_error_proto[i] = JS_NULL;
+            c1->iterator_ctor = JS_NULL;
+            c1->async_iterator_proto = JS_NULL;
+            c1->array_proto_values = JS_NULL;
+            c1->throw_type_error = JS_NULL;
+            c1->eval_obj = JS_NULL;
+            for(i = 0; i < JS_CONTEXT_VALUE_COUNT; i++)
+                c1->user_values[i] = JS_NULL;
+            c1->global_obj = JS_NULL;
+            c1->global_var_obj = JS_NULL;
+            c1->array_shape = NULL;
+            c1->arguments_shape = NULL;
+            c1->mapped_arguments_shape = NULL;
+            c1->regexp_shape = NULL;
+            c1->regexp_result_shape = NULL;
+            c1->binary_object_count = 0;
+            c1->binary_object_size = 0;
+        }
+        break;
+    case SNAP_CELL_RESOLVED:
+        break;
+    case SNAP_CELL_MODULE:
+    case SNAP_CELL_BYTECODE:
+        return snap_error(r, "live apply: %s #%d changed", snap_cell_type_names[c->type], idx);
+    default:
+        abort();
+    }
+    c->done = FALSE;
+    return 0;
+}
+
+int js_snapshot_debug; /* JS_ApplySnapshotChain() traces resets and tombstones on stderr */
+
+static void snap_free_jobs(JSRuntime *rt)
+{
+    struct list_head *el, *el1;
+    int i;
+    list_for_each_safe(el, el1, &rt->job_list) {
+        JSJobEntry *e = list_entry(el, JSJobEntry, link);
+        list_del(&e->link);
+        for(i = 0; i < e->argc; i++)
+            JS_FreeValueRT(rt, e->argv[i]);
+        JS_FreeContext(e->realm);
+        js_free_rt(rt, e);
+    }
+}
+
+/* Apply chained checkpoints to the live runtime they continue: the
+   checkpoints written after the base attached to 'rt' (the runtime was
+   restored from a chain, or wrote the chain itself). Cells the
+   checkpoints change are reset and read again in place, new cells are
+   created, cells the checkpoints free are released, and the state after
+   the last checkpoint becomes the base. The anchor, if any, stays.
+   On error the runtime is left inconsistent and must be freed. */
+int JS_ApplySnapshotChain(JSRuntime *rt, const uint8_t * const *deltas, const size_t *delta_lens,
+                          int delta_count, const JSSnapshotHost *host,
+                          JSSnapshotResult *res, char *errbuf, size_t errbuf_size)
+{
+    SnapReader rr, *r = &rr;
+    JSSnapshotBase *base = rt->snapshot_base;
+    SnapInput in;
+    size_t gc_threshold;
+    int i, d, ret = -1;
+
+    memset(r, 0, sizeof(*r));
+    memset(res, 0, sizeof(*res));
+    if (errbuf_size)
+        errbuf[0] = '\0';
+    r->rt = rt;
+    r->host = host;
+    r->errbuf = errbuf;
+    r->errbuf_size = errbuf_size;
+    r->bc.allow_bytecode = TRUE;
+    r->bc.is_snapshot = TRUE;
+    r->bc.first_atom = JS_ATOM_END;
+    gc_threshold = rt->malloc_gc_threshold;
+    rt->malloc_gc_threshold = SIZE_MAX;
+
+    if (!base) {
+        snap_error(r, "live apply: no base attached");
+        goto done;
+    }
+    if (rt->current_stack_frame) {
+        snap_error(r, "live apply: JS code is running");
+        goto done;
+    }
+    if (list_empty(&rt->context_list)) {
+        snap_error(r, "live apply: no context");
+        goto done;
+    }
+    if (snap_natives_init(rt, &r->natives, host, FALSE)) {
+        snap_error(r, "out of memory");
+        goto done;
+    }
+    r->ctx = list_entry(rt->context_list.next, JSContext, link);
+    r->bc.ctx = r->ctx;
+
+    /* seed the reader with the base: its cells are the live ones */
+    if (snap_resize(rt, (void **)&r->cells, sizeof(r->cells[0]), &r->cell_size, base->cell_count) ||
+        snap_resize(rt, (void **)&r->strs, sizeof(r->strs[0]), &r->str_size, base->str_count)) {
+        snap_error(r, "out of memory");
+        goto done;
+    }
+    r->bc.idx_to_atom = js_malloc_rt(rt, sizeof(r->bc.idx_to_atom[0]) * max_int(base->atom_count, 1));
+    if (!r->bc.idx_to_atom) {
+        snap_error(r, "out of memory");
+        goto done;
+    }
+    for(i = 0; i < base->cell_count; i++) {
+        SnapRCell *c = &r->cells[i];
+        memset(c, 0, sizeof(*c));
+        c->type = base->cells[i].type;
+        c->ptr = base->cells[i].ptr;
+        c->done = TRUE;
+        c->dead = (c->ptr == NULL);
+        if (c->ptr) {
+            SnapCell c1 = { c->ptr, c->type };
+            snap_cell_dup(&c1); /* held until the end, as the reader holds its shells */
+        }
+    }
+    r->cell_count = r->base_cell_count = base->cell_count;
+    for(i = 0; i < base->atom_count; i++)
+        r->bc.idx_to_atom[r->bc.idx_to_atom_count++] = JS_DupAtom(r->ctx, base->atoms[i]);
+    for(i = 0; i < base->str_count; i++) {
+        JSValue v = base->strs[i], str;
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_STRING) {
+            str = JS_DupValue(r->ctx, v);
+        } else {
+            str = JS_ToString(r->ctx, v); /* a rope: its flat content */
+            if (JS_IsException(str))
+                goto fail;
+        }
+        r->strs[r->str_count++] = JS_VALUE_GET_STRING(str);
+    }
+    r->base_atom_count = r->bc.idx_to_atom_count;
+    r->base_str_count = r->str_count;
+    if (snap_grow_cur(r))
+        goto fail;
+    for(i = 0; i < base->cell_count; i++) {
+        if (!r->cells[i].dead)
+            snap_set_cur(r, i, base->bodies + base->body_offsets[i],
+                         base->body_offsets[i + 1] - base->body_offsets[i], FALSE);
+    }
+    r->base_id = base->id;
+    r->chain_id = base->id;
+    r->roots_seeded = TRUE;
+
+    /* the checkpoints, as JS_ReadSnapshotChain() reads them */
+    for(d = 0; d < delta_count; d++) {
+        uint64_t id;
+        uint32_t n, ndead, idx;
+        int start = r->cell_count;
+        SnapKind kind;
+        SnapInput bodies;
+
+        in.start = in.ptr = deltas[d];
+        in.end = deltas[d] + delta_lens[d];
+        snap_set_input(r, &in);
+        if (snap_read_header(r, SNAP_KIND_DELTA, &id, &kind))
+            goto fail;
+        if (!r->chain_id || id != r->chain_id) {
+            snap_error(r, "checkpoint #%d does not continue the runtime's base", d);
+            goto fail;
+        }
+        if (kind != SNAP_KIND_CHAIN) {
+            snap_error(r, "checkpoint #%d is a plain delta: a live apply takes chained checkpoints", d);
+            goto fail;
+        }
+        if (snap_read_cell_headers(r) || snap_new_cells(r, start) || snap_grow_cur(r))
+            goto fail;
+        if (snap_hdr_leb(r, &n))
+            goto fail;
+        for(i = 0; i < n; i++) {
+            if (snap_hdr_leb(r, &idx))
+                goto fail;
+            if (idx >= start || r->cells[idx].dead || r->cells[idx].changed_in == d + 1) {
+                snap_error(r, "invalid changed cell");
+                goto fail;
+            }
+            r->cells[idx].changed_in = d + 1;
+            r->cells[idx].changed = TRUE;
+        }
+        if (snap_hdr_leb(r, &ndead))
+            goto fail;
+        for(i = 0; i < ndead; i++) {
+            if (snap_hdr_leb(r, &idx))
+                goto fail;
+            if (idx >= start || r->cells[idx].dead || r->cells[idx].changed_in == d + 1) {
+                snap_error(r, "invalid tombstone");
+                goto fail;
+            }
+            if (r->cells[idx].type == SNAP_CELL_CONTEXT) {
+                snap_error(r, "freed context #%u", idx);
+                goto fail;
+            }
+            r->cells[idx].dead = TRUE;
+            snap_set_cur(r, idx, NULL, 0, FALSE);
+        }
+        if (snap_read_atoms(r) || snap_read_strings(r) ||
+            snap_hdr_section(r, &r->delta_roots))
+            goto fail;
+        bodies.start = deltas[d];
+        bodies.ptr = r->bc.ptr;
+        bodies.end = deltas[d] + delta_lens[d];
+        if (snap_apply_delta_bodies(r, &bodies, start, d, n))
+            goto fail;
+        r->chain_id = snap_hash64(deltas[d], delta_lens[d]) | 1;
+        r->attach_chain = TRUE;
+    }
+
+    r->obj_flags = js_mallocz_rt(rt, max_int(r->cell_count, 1));
+    if (!r->obj_flags) {
+        snap_error(r, "out of memory");
+        goto fail;
+    }
+    /* the flags of the objects that are not read again are kept */
+    for(i = 0; i < r->base_cell_count; i++) {
+        SnapRCell *c = &r->cells[i];
+        if (c->type == SNAP_CELL_OBJECT && !c->dead && !c->changed) {
+            JSObject *p = c->ptr;
+            r->obj_flags[i] = (p->extensible ? SNAP_OBJ_EXTENSIBLE : 0) |
+                (p->is_std_array_prototype ? SNAP_OBJ_STD_ARRAY_PROTO : 0) |
+                (p->has_immutable_prototype ? SNAP_OBJ_IMMUTABLE_PROTO : 0) |
+                (p->is_constructor ? SNAP_OBJ_CONSTRUCTOR : 0) |
+                (p->is_HTMLDDA ? SNAP_OBJ_HTMLDDA : 0);
+        }
+    }
+    /* resetting an ArrayBuffer detaches its views: read them again too */
+    for(i = 0; i < r->base_cell_count; i++) {
+        SnapRCell *c = &r->cells[i];
+        JSObject *p;
+        struct list_head *el;
+        if (c->type != SNAP_CELL_OBJECT || c->dead || !c->changed)
+            continue;
+        p = c->ptr;
+        if (p->class_id != JS_CLASS_ARRAY_BUFFER && p->class_id != JS_CLASS_SHARED_ARRAY_BUFFER)
+            continue;
+        if (!p->u.array_buffer)
+            continue;
+        list_for_each(el, &p->u.array_buffer->array_list) {
+            JSTypedArray *ta = list_entry(el, JSTypedArray, link);
+            SnapMapEntry *e = snap_map_find(&base->cell_map, ta->obj);
+            if (e && base->cells[e->val].ptr == ta->obj && !r->cells[e->val].dead)
+                r->cells[e->val].changed = TRUE;
+        }
+    }
+    /* the changed cells become shells: their old bodies release their references */
+    for(i = 0; i < r->base_cell_count; i++) {
+        if (js_snapshot_debug && (r->cells[i].changed || r->cells[i].dead)) {
+            SnapRCell *c = &r->cells[i];
+            fprintf(stderr, "apply: cell #%d %s%s class %d refs %d\n", i, snap_cell_type_names[c->type],
+                    c->dead ? " dead" : " changed",
+                    c->type == SNAP_CELL_OBJECT && c->ptr ? ((JSObject *)c->ptr)->class_id : -1,
+                    c->ptr ? js_rc(c->ptr)->ref_count : -1);
+        }
+        if (r->cells[i].changed && !r->cells[i].dead && snap_reset_cell(r, i))
+            goto fail;
+    }
+    /* the roots of the last checkpoint replace the live ones */
+    snap_free_jobs(rt);
+    if (rt->suspended) {
+        async_func_free(rt, rt->suspended);
+        rt->suspended = NULL;
+    }
+    snap_set_input(r, &r->delta_roots);
+    if (snap_read_roots(r, res))
+        goto fail;
+    if (r->bc.ptr != r->bc.buf_end) {
+        snap_error(r, "corrupted roots");
+        goto fail;
+    }
+    if (snap_read_bodies(r))
+        goto fail;
+    for(i = 0; i < r->cell_count; i++) {
+        if (!r->cells[i].done && !r->cells[i].dead) {
+            snap_error(r, "%s #%d has no body", snap_cell_type_names[r->cells[i].type], i);
+            goto fail;
+        }
+    }
+    while (r->fixup_count > 0) {
+        SnapFixup *f = &r->fixups[--r->fixup_count];
+        if (f->func(r, f->opaque, FALSE))
+            goto fail;
+    }
+    for(i = 0; i < r->cell_count; i++) {
+        if (r->cells[i].type == SNAP_CELL_OBJECT && !r->cells[i].dead) {
+            JSObject *p = r->cells[i].ptr;
+            int flags = r->obj_flags[i];
+            p->extensible = (flags & SNAP_OBJ_EXTENSIBLE) != 0;
+            p->is_std_array_prototype = (flags & SNAP_OBJ_STD_ARRAY_PROTO) != 0;
+            p->has_immutable_prototype = (flags & SNAP_OBJ_IMMUTABLE_PROTO) != 0;
+            p->is_constructor = (flags & SNAP_OBJ_CONSTRUCTOR) != 0;
+            p->is_HTMLDDA = (flags & SNAP_OBJ_HTMLDDA) != 0;
+        }
+    }
+    rt->malloc_gc_threshold = gc_threshold;
+    for(i = 0; i < r->opaque_count; i++) {
+        SnapOpaque *o = &r->opaques[i];
+        if (host->load_opaque(r->ctx, JS_MKPTR(JS_TAG_OBJECT, o->obj), o->saved,
+                              host->opaque) < 0)
+            goto fail;
+    }
+    /* the restored state is the base of the next checkpoint */
+    if (snap_attach_read_base(r, r->cell_count, r->cur_ptrs, r->cur_lens,
+                              r->bc.idx_to_atom_count, r->str_count,
+                              r->chain_id, TRUE))
+        goto fail;
+    /* cells created and freed within these checkpoints never got a body:
+       empty shells, released without a class finalizer */
+    for(i = r->base_cell_count; i < r->cell_count; i++) {
+        SnapRCell *c = &r->cells[i];
+        if (c->dead && c->ptr && c->type == SNAP_CELL_OBJECT) {
+            JSObject *p = c->ptr;
+            p->class_id = JS_CLASS_OBJECT;
+            p->fast_array = 0;
+            p->is_exotic = 0;
+        }
+    }
+    ret = 0;
+    goto done;
+ fail:
+    while (r->fixup_count > 0) {
+        SnapFixup *f = &r->fixups[--r->fixup_count];
+        f->func(r, f->opaque, TRUE);
+    }
+    snap_neutralize_cells(r);
+    if (errbuf_size && !errbuf[0]) {
         JSValue exc = r->ctx ? JS_GetException(r->ctx) : JS_UNINITIALIZED;
         const char *msg = NULL;
         if (JS_IsObject(exc)) {
